@@ -194,6 +194,9 @@ class _SasSession:
     # Set only once the user's MACs actually verified — `done` must never
     # finalise a session before that (Element X can send done before mac).
     mac_verified: bool = False
+    # The key ids (`ed25519:<pubkey>`) whose MAC verified.  Cross-signing uses
+    # this: only a key the exchange really compared may be signed afterwards.
+    verified_key_ids: set[str] = field(default_factory=set)
     created_at: float = field(default_factory=time.time)
     we_initiated: bool = False  # True when *we* sent the request (initiator)
     their_commitment: str = ""  # initiator: commitment from their accept
@@ -203,10 +206,11 @@ class _SasSession:
 class SasVerificationHandler:
     """Responder for inbound Matrix SAS (emoji) verification flows."""
 
-    def __init__(self, adapter: Any, client: Any, olm: Any) -> None:
+    def __init__(self, adapter: Any, client: Any, olm: Any, cross_signing: Any = None) -> None:
         self._adapter = adapter
         self._client = client
         self._olm = olm
+        self._cross_signing = cross_signing  # cross_signing.CrossSigningSigner
         self._sessions: dict[str, _SasSession] = {}
         self._registered = False
 
@@ -953,6 +957,7 @@ class SasVerificationHandler:
             # skipped, but a MAC map that matches nothing proves nothing —
             # previously it returned True and "verified" the device.
             verified = 0
+            verified_ids: set[str] = set()
             for key_id, mac_value in macs.items():
                 public_key = known.get(key_id)
                 if public_key is None:
@@ -966,6 +971,7 @@ class SasVerificationHandler:
                     logger.warning("Matrix: MAC mismatch for %s", key_id)
                     return False
                 verified += 1
+                verified_ids.add(str(key_id))
 
             if verified == 0:
                 logger.warning(
@@ -976,6 +982,7 @@ class SasVerificationHandler:
                 return False
 
             session.mac_verified = True
+            session.verified_key_ids = verified_ids
             logger.info("Matrix: user MACs verified for %s", session.other_user)
             return True
         except Exception as exc:
@@ -1162,16 +1169,37 @@ class SasVerificationHandler:
             "Matrix: SAS verification with %s completed successfully 🎉",
             session.other_user,
         )
+        cross_signed = await self._cross_sign_user(session)
         room_id = session.room_id or await self._find_dm_room(session.other_user)
         if room_id:
             try:
-                await self._adapter.send(
-                    room_id,
-                    "✅ Verification successful! The device is now marked as "
-                    "verified.",
-                )
+                if cross_signed:
+                    text = (
+                        "✅ Verification successful! I signed your identity with my "
+                        "user-signing key, so this account now counts as verified on "
+                        "my side too."
+                    )
+                else:
+                    text = (
+                        "✅ Verification successful! The device is now marked as "
+                        "verified."
+                    )
+                await self._adapter.send(room_id, text)
             except Exception as exc:
                 logger.debug("Matrix: success notification failed: %s", exc)
+
+    async def _cross_sign_user(self, session: _SasSession) -> bool:
+        """Publish our signature for the user's identity, if this exchange earned it."""
+        signer = self._cross_signing
+        if signer is None:
+            return False
+        try:
+            return bool(
+                await signer.trust_user(session.other_user, session.verified_key_ids)
+            )
+        except Exception as exc:
+            logger.debug("Matrix: cross-signing %s failed: %s", session.other_user, exc)
+            return False
 
     def _expire_old_sessions(self) -> None:
         now = time.time()

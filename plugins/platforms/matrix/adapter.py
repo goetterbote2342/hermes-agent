@@ -844,10 +844,11 @@ class MatrixAdapter(BasePlatformAdapter):
         self._store_dir: Optional[Path] = None  # pinned per profile in connect()
         self._sync_task: Optional[asyncio.Task] = None
         self._sas_verification: Any = None  # verification.SasVerificationHandler
+        self._cross_signing: Any = None  # cross_signing.CrossSigningSigner
         # TTL cache for room-key requests: (room_id, session_id) -> timestamp.
         # Prevents re-requesting the same missing megolm session on every sync
         # cycle when the sender never answers (request-loop guard).
-        self._room_key_requested: Dict[tuple, float] = {}
+        self._room_key_requested: dict[tuple, float] = {}
         self._invite_join_tasks: dict[str, asyncio.Task] = {}
         self._closing = False
         self._startup_ts: float = 0.0
@@ -1354,10 +1355,27 @@ class MatrixAdapter(BasePlatformAdapter):
         # bot's device from any Matrix client (Element Web/X, ...). Only active
         # when E2EE is enabled, since it needs the OlmMachine.
         if self._encryption and getattr(client, "crypto", None) is not None:
+            # Cross-signing signatures: our own device signed by our self-signing
+            # key (so clients chain it to our identity), and — after a successful
+            # SAS exchange — the other user's master key signed by our
+            # user-signing key. Both need the private half of our cross-signing
+            # identity, imported in _verify_or_bootstrap_cross_signing() above.
+            try:
+                from .cross_signing import CrossSigningSigner
+
+                self._cross_signing = CrossSigningSigner(self, client, client.crypto)
+                await self._cross_signing.sign_own_device()
+            except Exception as exc:
+                logger.warning(
+                    "Matrix: cross-signing signature helper could not be enabled: %s", exc
+                )
+                self._cross_signing = None
             try:
                 from .verification import SasVerificationHandler
 
-                self._sas_verification = SasVerificationHandler(self, client, client.crypto)
+                self._sas_verification = SasVerificationHandler(
+                    self, client, client.crypto, cross_signing=self._cross_signing
+                )
                 self._sas_verification.register()
             except Exception as exc:
                 logger.warning(
@@ -1366,6 +1384,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 self._sas_verification = None
         else:
             self._sas_verification = None
+            self._cross_signing = None
         self._startup_ts = time.time()
         self._reset_clock_skew_detector()  # a reconnect after an NTP fix starts clean
         self._closing = False

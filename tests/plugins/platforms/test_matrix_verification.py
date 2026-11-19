@@ -455,3 +455,58 @@ class TestDoneOrdering:
         asyncio.run(handler._finalize(session))
         assert handler._sessions.get("t-1") is session
         assert adapter.sent == []
+
+
+class _RecordingSigner:
+    def __init__(self, result=True):
+        self.result = result
+        self.calls = []
+
+    async def trust_user(self, user_id, verified_key_ids=()):
+        self.calls.append((user_id, set(verified_key_ids)))
+        return self.result
+
+
+class TestCrossSigningOnFinalize:
+    def _handler(self, signer=None):
+        adapter = _FakeAdapter()
+        handler = _make_mac_handler(adapter=adapter)
+        handler._cross_signing = signer
+        session = _make_session()
+        session.mac_verified = True
+        session.verified_key_ids = {"ed25519:ALICEMSK"}
+        handler._sessions[session.transaction_id] = session
+        return handler, session, adapter
+
+    def test_passes_the_verified_key_ids_to_the_signer(self):
+        signer = _RecordingSigner(result=True)
+        handler, session, adapter = self._handler(signer)
+        asyncio.run(handler._finalize(session))
+        assert signer.calls == [("@alice:example.org", {"ed25519:ALICEMSK"})]
+        assert handler._sessions == {}
+        assert adapter.sent and "signed your identity" in adapter.sent[0][1]
+
+    def test_without_a_signer_the_device_message_stays(self):
+        handler, session, adapter = self._handler(None)
+        asyncio.run(handler._finalize(session))
+        assert handler._sessions == {}
+        assert adapter.sent and "signed your identity" not in adapter.sent[0][1]
+        assert "Verification successful" in adapter.sent[0][1]
+
+    def test_declining_signer_still_finishes_the_verification(self):
+        signer = _RecordingSigner(result=False)
+        handler, session, adapter = self._handler(signer)
+        asyncio.run(handler._finalize(session))
+        assert signer.calls == [("@alice:example.org", {"ed25519:ALICEMSK"})]
+        assert handler._sessions == {}
+        assert adapter.sent and "signed your identity" not in adapter.sent[0][1]
+
+    def test_signer_error_is_swallowed(self):
+        class _Broken:
+            async def trust_user(self, user_id, verified_key_ids=()):
+                raise RuntimeError("boom")
+
+        handler, session, adapter = self._handler(_Broken())
+        asyncio.run(handler._finalize(session))
+        assert handler._sessions == {}
+        assert adapter.sent and "Verification successful" in adapter.sent[0][1]
